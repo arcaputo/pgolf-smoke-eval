@@ -23,7 +23,8 @@ It sends back, as critique:
 | No artifact, or a wrong logged size | No `final_model*.ptz`; the logged total ≠ `train_gpt.py` + that file, measured on disk; over 16,000,000 bytes |
 | Not the whole validation split | The scored tokens per byte (val_bpb·ln2/val_loss) match no full-split prefix (see pgolf-8xh100's README) |
 | Network use | An audit hook (`audit/sitecustomize.py`, on PYTHONPATH for every rank) records Python's `socket.connect`, `getaddrinfo` and `urllib` events to other machines |
-| Training data read after training | The same hook times every data file opened, and every training log line as the run writes it; a `fineweb_train_*` opened after the last one is a problem |
+| Training data read during evaluation | The same hook times every data file opened, every training log line and every `Total submission size` line as the run writes them; a `fineweb_train_*` opened after the last size line is a problem |
+| Calibration outside the training budget | A `fineweb_train_*` opened between the last training line and the last size line (e.g. GPTQ Hessians) is a problem only if training used the whole `MAX_WALLCLOCK_SECONDS`; a run that stops its loop early to reserve time for calibration, as the challenge's GPTQ records do, passes |
 
 It also reports the short run's val_bpb, artifact, steps and times, and its one-GPU export-plus-eval time. That
 time is about 8× the 8-GPU time and is only reported.
@@ -47,4 +48,8 @@ artifact is 10.3 MB after 180 s on one GPU, against 15.9 MB after 10 minutes on 
 untrained, and `fits_16mb` = 1 says little. `pgolf-8xh100` measures the real artifact, and a miss there sets
 `meets_rules` = 0.
 
-Settings: `SMOKE_TRAIN_S` (180), `SMOKE_TIMEOUT_S` (1800), `SMOKE_TRAIN_SHARDS` (2).
+**The time limit** is long because evaluation on one GPU takes about 8× its 8-GPU time: a 2048-context
+stride-64 sliding window that takes ~370 s on 8×H100 takes ~50 minutes here. `SMOKE_TIMEOUT_S` (5400) lets a
+legal 600 s 8-GPU evaluation finish; a run still evaluating past it is reported as too slow.
+
+Settings: `SMOKE_TRAIN_S` (180), `SMOKE_TIMEOUT_S` (5400), `SMOKE_TRAIN_SHARDS` (2).

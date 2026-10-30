@@ -12,12 +12,16 @@ validation shard and two training shards, and MAX_WALLCLOCK_SECONDS=SMOKE_TRAIN_
   - no final_model*.ptz file, an artifact (train_gpt.py + that file) over 16,000,000 bytes, or a logged
     `Total submission size` that differs from the artifact measured on disk
   - a scored set that isn't the whole validation split (tokens/byte from val_loss and val_bpb, see bench.py)
-  - network access, or a training shard opened after training ended (an audit hook, audit/sitecustomize.py)
+  - network access (an audit hook, audit/sitecustomize.py)
+  - a training shard opened after the artifact's size line (training data read during evaluation), or between the
+    training clock's stop and that line (calibration) when the run used its whole MAX_WALLCLOCK_SECONDS and so left
+    no time for it: calibration on training data must fit in the training budget, as the challenge rules
 
 The artifact here comes from a short training, so its size is an estimate of the full run's (the benchmark measures
 that); the eval time on one GPU is about 8× the 8-GPU one and only reported.
 
-Environment variables: SMOKE_TRAIN_S (180), SMOKE_TIMEOUT_S (1800), SMOKE_TRAIN_SHARDS (2).
+Environment variables: SMOKE_TRAIN_S (180), SMOKE_TIMEOUT_S (5400: on one GPU, evaluation takes about 8× its
+8-GPU time, so a legal 600 s evaluation can take up to ~4800 s here), SMOKE_TRAIN_SHARDS (2).
 """
 
 from __future__ import annotations
@@ -44,9 +48,10 @@ import bench  # noqa: E402  (pgolf-8xh100's bench.py, shipped with this eval: th
 
 HERE = Path(__file__).resolve().parent
 SMOKE_TRAIN_S = float(os.environ.get("SMOKE_TRAIN_S", "180"))
-SMOKE_TIMEOUT_S = int(os.environ.get("SMOKE_TIMEOUT_S", "1800"))
+SMOKE_TIMEOUT_S = int(os.environ.get("SMOKE_TIMEOUT_S", "5400"))
 SMOKE_TRAIN_SHARDS = int(os.environ.get("SMOKE_TRAIN_SHARDS", "2"))
 STOP_GRACE_S = 10.0  # one step on one GPU is ~8× an 8-GPU step
+RESERVE_MIN_S = 1.0  # a run that stopped this far before its cap kept time for calibration after the loop
 
 
 def stopped(out: str) -> bool:
@@ -116,12 +121,28 @@ def main() -> None:
                         + ". No network calls or downloads are allowed during training or evaluation.")
     marks = [e[1] for e in events if e[0] == "train_line"]
     t_end = max(marks) if marks else r.get("t_train_end")
+    sizes = [e[1] for e in events if e[0] == "size_line"]
+    t_size = max(sizes) if sizes else None  # the last `Total submission size` line: the artifact is final
     late = [e for e in events if e[0] == "open" and "fineweb_train_" in e[2] and t_end and e[1] > t_end]
-    if late:
-        problems.append(f"train_gpt.py opened training data after training ended ({Path(late[0][2]).name}, "
-                        f"{late[0][1] - t_end:.0f} s after the last training step). Evaluation may not read training "
-                        "data, and anything that uses it to change the model (such as quantization calibration) must "
-                        "run inside the 600 s training budget.")
+    in_eval = [e for e in late if t_size is not None and e[1] > t_size]
+    in_export = [e for e in late if e not in in_eval]
+    train_s = r.get("train_time_s")
+    reserved = SMOKE_TRAIN_S - train_s if train_s is not None else 0.0
+    if in_eval:
+        problems.append(f"train_gpt.py opened training data during evaluation ({Path(in_eval[0][2]).name}, "
+                        f"{in_eval[0][1] - t_size:.0f} s after the `Total submission size` line). Evaluation may not "
+                        "read training data.")
+    if in_export and reserved < RESERVE_MIN_S:
+        problems.append(f"train_gpt.py opened training data after the training clock stopped "
+                        f"({Path(in_export[0][2]).name}, {in_export[0][1] - t_end:.0f} s after the last training "
+                        f"step), while its training used the whole MAX_WALLCLOCK_SECONDS={SMOKE_TRAIN_S:.0f} "
+                        f"(train_time {train_s} s). Anything that uses training data to change the model, such as "
+                        "quantization calibration, belongs in the 600 s training budget: stop the training loop "
+                        "early enough to leave time for it within MAX_WALLCLOCK_SECONDS, or calibrate on sequences "
+                        "the model generates itself.")
+    elif in_export:
+        print(f"training data opened {in_export[0][1] - t_end:.0f} s after the training clock stopped, inside the "
+              f"{reserved:.0f} s the run reserved of its cap (calibration)", flush=True)
     opens = sum(1 for e in events if e[0] == "open")
     a = r.get("artifact_bytes")
     print(f"rc {r['rc']}, val_bpb {r.get('val_bpb')} ({r.get('score_label')}), prequant {r.get('prequant_val_bpb')}, "

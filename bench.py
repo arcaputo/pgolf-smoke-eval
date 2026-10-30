@@ -16,7 +16,8 @@ SXM machine the eval:
        - val_bpb: the last `<label>_exact val_loss:X val_bpb:Y` line
        - train_time: the run's own last `train_time:Nms` (compile and warmup excluded, as on the leaderboard)
        - pre_serialize_s: train_time plus the wall time from the last training line to the first serialization line
-         (`Serialized model` / `Total submission size`), so calibration on data after the clock counts as training
+         (`Serialized model` / `Total submission size`), less any evaluation logged in between (`eval_time:Nms`), so
+         calibration on data after the clock and before that line counts as training
        - eval_time: the wall time from the last training line to the run's exit
        - the artifact: the bytes of train_gpt.py plus the size of the final_model*.ptz file, measured on disk, and
          compared with the last `Total submission size ...: N bytes` line
@@ -26,7 +27,8 @@ SXM machine the eval:
   5. Reports the mean val_bpb (primary, lower is better) with its standard error, the artifact, the times, and
      meets_rules: 1 only if every candidate run meets every rule above (artifact ≤ 16,000,000 bytes and matching the
      logged size; train_time and pre_serialize_s ≤ 600 s; eval_time ≤ 600 s; the score printed after the artifact's
-     size line; the scored set). A rule miss is reported with meets_rules = 0 and the reason in rule_misses, not raised.
+     size line; the scored set; a clean exit). A rule miss is reported with meets_rules = 0 and the reason in rule_misses,
+     not raised; only a run with no score line (a crash before it, or a timeout) raises.
 
 The static rules (no network, one file, the metric code) are checked by pgolf-rules before this runs, and a short
 one-GPU run by pgolf-smoke.
@@ -39,6 +41,7 @@ Local checks, no GPU: python bench.py --parse <stdout.txt> ... ; python bench.py
 
 from __future__ import annotations
 
+import http.client
 import json
 import math
 import os
@@ -92,9 +95,10 @@ NPROC = int(os.environ.get("KX_NPROC", "8"))
 EVAL_TIMEOUT_S = int(os.environ.get("HARNESS_EVAL_TIMEOUT_S", "9000"))
 MIN_RUNS = 2  # fewer candidate runs than this (out of time) aren't scored
 
-SCORE = re.compile(r"^(\S+)_exact val_loss:(\S+) val_bpb:(\S+)\s*$")
-PREQUANT = re.compile(r"^step:(\d+)/(\d+) val_loss:(\S+) val_bpb:(\S+) train_time:(\d+)ms")
-TRAIN_LINE = re.compile(r"^(?:step:(\d+)/\d+ .*train_time:(\d+)ms|stopping_early:.*train_time:(\d+)ms)")
+SCORE = re.compile(r"^(\S+)_exact val_loss:(\S+) val_bpb:(\S+)(?:\s.*)?$")  # extra fields after val_bpb are allowed
+PREQUANT = re.compile(r"^step:(\d+)/(\d+) val_loss:(\S+) val_bpb:(\S+) train_time:\s*(\d+)ms")
+TRAIN_LINE = re.compile(r"^(?:step:(\d+)/\d+ .*train_time:\s*(\d+)ms|stopping_early:.*train_time:\s*(\d+)ms)")
+EVAL_TIME = re.compile(r"\beval_time:\s*(\d+(?:\.\d+)?)ms")
 SERIALIZE = re.compile(r"^(?:Serialized model|Total submission size)")
 SIZE = re.compile(r"^Total submission size[^:]*:\s*(\d+) bytes")
 TRACEBACK = re.compile(r"^(\[rank\d+\]:\s?)?Traceback \(most recent call last\):", re.M)
@@ -121,15 +125,19 @@ def variant_of(code: Path) -> str:
 
 
 def fetch(url: str, dest: Path) -> Path:
+    """Download url into dest, retrying a failed or truncated download (a cut connection raises
+    http.client.IncompleteRead, which isn't an OSError; a shard is also checked against its header)."""
     path = dest / url.rsplit("/", 1)[1]
-    for attempt in range(5):
+    for attempt in range(6):
         try:
             with urllib.request.urlopen(url, timeout=300) as r, open(path, "wb") as f:  # noqa: S310
                 while chunk := r.read(1 << 24):
                     f.write(chunk)
+            if path.suffix == ".bin":
+                check_shard(path)
             return path
-        except OSError as e:
-            print(f"download {url} failed ({e}), attempt {attempt + 1}", flush=True)
+        except (OSError, http.client.HTTPException, ValueError) as e:
+            print(f"download {url} failed ({e!r}), attempt {attempt + 1}", flush=True)
             time.sleep(5 * (attempt + 1))
     raise SystemExit(f"could not download {url}")
 
@@ -139,9 +147,11 @@ def check_shard(path: Path) -> int:
     import struct
 
     with open(path, "rb") as f:
-        magic, version, n = struct.unpack("<3i", f.read(12))
+        head = f.read(12)
+    magic, version, n = struct.unpack("<3i", head) if len(head) == 12 else (0, 0, 0)
     if magic != 20240520 or version != 1 or path.stat().st_size != 1024 + 2 * n:
-        raise SystemExit(f"downloaded shard {path.name} is corrupt (header {magic}, {version}, {n})")
+        raise ValueError(f"downloaded shard {path.name} is corrupt (header {magic}, {version}, {n}, "
+                         f"{path.stat().st_size} bytes)")
     return n
 
 
@@ -161,8 +171,6 @@ def prepare_data(root: Path, variant: str, train_shards: int | None = None) -> t
     with ThreadPoolExecutor(16) as pool:
         paths = list(pool.map(lambda j: fetch(*j), jobs))
     for p in paths:
-        if p.suffix == ".bin":
-            check_shard(p)
         p.chmod(0o444)
     data.chmod(0o555)
     tok.chmod(0o555)
@@ -219,7 +227,9 @@ def scored_set_ok(val_loss: float, val_bpb: float, ref: dict) -> tuple[bool, str
         return True, f"tokens/byte {r:.8f} = the first {ref['k0'] + i:,} of {ref['targets']:,} targets"
     return False, (f"the scored tokens/byte, val_bpb·ln2/val_loss = {r:.8f}, matches no prefix of the validation split "
                    f"that leaves at most {MAX_UNSCORED_TAIL:,} of its {ref['targets']:,} targets unscored "
-                   f"({ref['lo']:.8f}–{ref['hi']:.8f}): some tokens were skipped or scored twice, or bytes miscounted")
+                   f"({ref['lo']:.8f}–{ref['hi']:.8f}): some tokens were skipped or scored twice (for example the "
+                   "last windows of a sliding-window evaluation), or tokens or bytes were miscounted (count them "
+                   "exactly, in int64 or float64)")
 
 
 def parent_code(subject: Path, work: Path) -> Path | None:
@@ -278,6 +288,7 @@ def parse(lines: list[tuple[float, str]], t_exit: float | None = None) -> dict:
     """Numbers from a run's (time, line) output. Keys are missing when the run never printed them."""
     out: dict = {}
     t_train_end = t_serialize = None
+    eval_ms = 0.0  # evaluation the run logs (`eval_time:Nms`) between the last training line and serialization
     score_at = size_at = -1
     for i, (t, line) in enumerate(lines):
         if m := SCORE.match(line):
@@ -289,7 +300,9 @@ def parse(lines: list[tuple[float, str]], t_exit: float | None = None) -> dict:
             out["train_time_s"] = max(out.get("train_time_s", 0.0), int(m.group(2) or m.group(3)) / 1000)
             if m.group(1):
                 out["steps"] = max(out.get("steps", 0), int(m.group(1)))
-            t_train_end, t_serialize = t, None
+            t_train_end, t_serialize, eval_ms = t, None, 0.0
+        elif t_train_end is not None and t_serialize is None and (m := EVAL_TIME.search(line)):
+            eval_ms += float(m.group(1))
         if SERIALIZE.match(line) and t_train_end is not None and t_serialize is None:
             t_serialize = t
         if m := SIZE.match(line):
@@ -300,7 +313,8 @@ def parse(lines: list[tuple[float, str]], t_exit: float | None = None) -> dict:
     if t_exit is not None and t_train_end is not None:
         out["eval_time_s"] = t_exit - t_train_end
         if t_serialize is not None and "train_time_s" in out:
-            out["pre_serialize_s"] = out["train_time_s"] + (t_serialize - t_train_end)
+            # a diagnostic evaluation of the trained weights before export isn't training
+            out["pre_serialize_s"] = out["train_time_s"] + max(0.0, t_serialize - t_train_end - eval_ms / 1000)
     return out
 
 
@@ -352,6 +366,9 @@ def rule_misses(r: dict, ref: dict | None, train_limit_s: float = TRAIN_LIMIT_S,
                 eval_limit_s: float | None = EVAL_LIMIT_S, serialize_limit: bool = True) -> list[str]:
     """Every runtime rule the run broke, in words."""
     misses = []
+    if r.get("rc") not in (0, None):
+        misses.append(f"train_gpt.py exited with code {r['rc']} after printing its score" if r["rc"] != -9 else
+                      "train_gpt.py printed its score but was still running at the run's time limit, and was killed")
     a, printed = r.get("artifact_bytes"), r.get("printed_bytes")
     if r.get("model_bytes") is None:
         misses.append("no final_model*.ptz artifact file was written, so the artifact can't be measured")
@@ -371,8 +388,9 @@ def rule_misses(r: dict, ref: dict | None, train_limit_s: float = TRAIN_LIMIT_S,
     ps = r.get("pre_serialize_s")
     if serialize_limit and ps is not None and ps > train_limit_s + SERIALIZE_GRACE_S:
         misses.append(f"{ps:.1f} s passed from the start of training to serialization (train_time {t:.1f} s plus "
-                      f"{ps - t:.1f} s after the last training step) > {train_limit_s:.0f} s: anything that uses data "
-                      "to change the model, such as quantization calibration, must fit in the training budget")
+                      f"{ps - t:.1f} s after the last training step, logged evaluation excluded) > {train_limit_s:.0f} "
+                      "s: anything that uses data to change the model, such as quantization calibration, must fit in "
+                      "the training budget")
     e = r.get("eval_time_s")
     if eval_limit_s is not None and e is not None and e > eval_limit_s:
         misses.append(f"evaluation took {e:.0f} s > {eval_limit_s:.0f} s")
@@ -444,7 +462,13 @@ def main() -> None:
                         ignore=shutil.ignore_patterns("logs", "__pycache__", "*.ptz", "*.pt"))
         base_code = parent_code(subject, work / "parent")
         codes = {"candidate": cand_code, "parent": base_code}
-        variants = {who: variant_of(c) for who, c in codes.items() if c is not None}
+        variants = {"candidate": variant_of(cand_code)}
+        if base_code is not None:
+            try:
+                variants["parent"] = variant_of(base_code)
+            except SystemExit as e:
+                print(f"the parent's code can't run here, so no parent run: {e}", flush=True)
+                base_code = codes["parent"] = None
         root = tmp / "dataroot"
         paths, refs = {}, {}
         for v in dict.fromkeys(variants.values()):
@@ -470,9 +494,9 @@ def main() -> None:
             r = run_once(codes[who], env, label, min(RUN_TIMEOUT_S, max(60.0, deadline - time.time())))
             r["seed"] = seed
             longest = max(longest, r["wall_s"])
-            if r["rc"] != 0 or r.get("val_bpb") is None:
+            if r.get("val_bpb") is None or r.get("val_loss") is None:
                 why = ("timed out" if r["rc"] == -9 else f"exit {r['rc']}" if r["rc"] else
-                       "no `<label>_exact val_loss:X val_bpb:Y` line with a finite val_bpb")
+                       "no `<label>_exact val_loss:X val_bpb:Y` line with a finite val_loss and val_bpb")
                 msg = f"{label}: train_gpt.py failed ({why}) after {r['wall_s']:.0f}s; "
                 if who == "parent":
                     print(msg + "the parent's code fails here, so there is no same-machine delta. "

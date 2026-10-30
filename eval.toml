@@ -11,7 +11,7 @@ condition = "problems == 0"
 
 [eval.schema.problems]
 type = "int"
-description = "Problems in a short run on one H100: a crash or hang, no stop at MAX_WALLCLOCK_SECONDS, no round-tripped score line, no final_model*.ptz, an artifact over 16,000,000 bytes or unlike the logged size, a partial or double-scored validation set, network use, or training data read after training"
+description = "Problems in a short run on one H100: a crash or hang, no stop at MAX_WALLCLOCK_SECONDS, no round-tripped score line, no final_model*.ptz, an artifact over 16,000,000 bytes or unlike the logged size, a partial or double-scored validation set, network use, training data read during evaluation, or calibration on training data with no time reserved for it in the training budget"
 
 [eval.schema.critique]
 type = "list[str]"

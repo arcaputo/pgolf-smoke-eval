@@ -1,8 +1,10 @@
 # The same environment as pgolf-8xh100 (python:3.12, its requirements.txt), on one H100: about 2 minutes of
-# compiling, 3 minutes of training, then export and the full validation evaluation on one GPU.
+# compiling, 3 minutes of training, then export and the full validation evaluation on one GPU. That evaluation
+# takes about 8x its 8-GPU time (a 2048-context sliding window: ~370 s on 8 GPUs, ~50 minutes here), so the run's
+# limit (SMOKE_TIMEOUT_S, 5400 s) allows a legal 600 s 8-GPU evaluation, and this leaves room for the data.
 image = "python:3.12"
 requirements = "requirements.txt"
-timeout_s = 3000
+timeout_s = 6600
 # A preempted spot run starts over from scratch; SkyPilot may recover it up to this many times.
 max_retries = 3
 

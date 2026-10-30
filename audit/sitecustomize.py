@@ -57,9 +57,11 @@ def _install() -> None:
 
     sys.addaudithook(hook)
 
-    # Training lines (`step:...train_time:` and `stopping_early:`), timed in this process, so a data file opened after
-    # the last one is known to come after it (the eval's own timestamps of the same lines arrive a little later).
+    # Training lines (`step:...train_time:` and `stopping_early:`) and artifact size lines (`Total submission size`),
+    # timed in this process, so a data file opened after the last one is known to come after it (the eval's own
+    # timestamps of the same lines arrive a little later).
     train_line = re.compile(r"^(?:step:\d+/\d+ .*train_time:|stopping_early:)", re.M)
+    size_line = re.compile(r"^Total submission size", re.M)
 
     class Stdout:
         def __init__(self, inner):
@@ -69,6 +71,8 @@ def _install() -> None:
             try:
                 if isinstance(text, str) and train_line.search(text):
                     f.write(json.dumps(["train_line", time.time(), ""]) + "\n")
+                if isinstance(text, str) and size_line.search(text):
+                    f.write(json.dumps(["size_line", time.time(), ""]) + "\n")
             except Exception:  # noqa: BLE001
                 pass
             return self._inner.write(text)
