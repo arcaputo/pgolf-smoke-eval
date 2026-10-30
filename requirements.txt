@@ -1,0 +1,10 @@
+# The environment train_gpt.py runs in, the same as the subject's requirements.txt: torch 2.9.1 from the cu128 wheel
+# index (the version most of the challenge's records ran), numpy and sentencepiece (the baseline's imports), and
+# zstandard and brotli for candidates that compress their artifact with them (zlib and lzma are in the standard
+# library). Pinned, so every scoring runs the same stack. No FlashAttention 3: SDPA's flash backend is available.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.9.1+cu128
+numpy==2.3.5
+sentencepiece==0.2.1
+zstandard==0.25.0
+brotli==1.2.0

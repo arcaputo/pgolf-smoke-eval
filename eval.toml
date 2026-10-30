@@ -1,0 +1,67 @@
+[eval]
+type = "qa"
+evaluator = "deterministic"
+entrypoint = "python smoke.py"
+
+[eval.qa]
+qa_cap = 3
+
+[eval.pass]
+condition = "problems == 0"
+
+[eval.schema.problems]
+type = "int"
+description = "Problems in a short run on one H100: a crash or hang, no stop at MAX_WALLCLOCK_SECONDS, no round-tripped score line, no final_model*.ptz, an artifact over 16,000,000 bytes or unlike the logged size, a partial or double-scored validation set, network use, or training data read after training"
+
+[eval.schema.critique]
+type = "list[str]"
+description = "The problems, with the first traceback for a crash, sent to the agent"
+
+[eval.schema.val_bpb]
+type = "float"
+display = "{:.4f}"
+description = "val_bpb of the short one-GPU run (not comparable with the benchmark's; -1 if none)"
+
+[eval.schema.prequant_val_bpb]
+type = "float"
+display = "{:.4f}"
+description = "val_bpb before export, from the last training-loop validation (-1 if none)"
+
+[eval.schema.artifact_bytes]
+type = "int"
+description = "train_gpt.py bytes plus the final_model*.ptz file's bytes, measured on disk after the short run (-1 if none)"
+
+[eval.schema.code_bytes]
+type = "int"
+description = "Bytes of train_gpt.py"
+
+[eval.schema.model_bytes]
+type = "int"
+description = "Bytes of the compressed model file (-1 if none)"
+
+[eval.schema.fits_16mb]
+type = "int"
+description = "1 if the short run's measured artifact is at most 16,000,000 bytes, else 0. A short run's weights compress far better than a full run's (the baseline: 10.3 MB here, 15.9 MB in 10 minutes on 8×H100), so 1 here does not mean the full run fits; pgolf-8xh100 decides"
+
+[eval.schema.steps]
+type = "int"
+description = "Training steps the short run reached"
+
+[eval.schema.train_time_s]
+type = "float"
+display = "{:.1f}"
+description = "The run's own train_time, seconds (the cap here is SMOKE_TRAIN_S, 180)"
+
+[eval.schema.eval_time_1gpu_s]
+type = "float"
+display = "{:.0f}"
+description = "Seconds from the end of training to exit on one GPU (export plus evaluation; about 8× the 8-GPU time)"
+
+[eval.schema.data_opens_audited]
+type = "int"
+description = "Data files the audit hook saw opened (0 means the audit saw nothing, so its checks were inert)"
+
+[eval.schema.wall_s]
+type = "float"
+display = "{:.0f}"
+description = "Eval wall time, seconds"

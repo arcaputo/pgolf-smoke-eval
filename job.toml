@@ -1,0 +1,13 @@
+# The same environment as pgolf-8xh100 (python:3.12, its requirements.txt), on one H100: about 2 minutes of
+# compiling, 3 minutes of training, then export and the full validation evaluation on one GPU.
+image = "python:3.12"
+requirements = "requirements.txt"
+timeout_s = 3000
+# A preempted spot run starts over from scratch; SkyPilot may recover it up to this many times.
+max_retries = 3
+
+[resources]
+cpus = "16+"
+memory = "64+"
+accelerators = "H100:1"
+use_spot = true
